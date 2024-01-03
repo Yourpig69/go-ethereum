@@ -1,237 +1,132 @@
-// Copyright 2014 The go-ethereum Authors
-// This file is part of the go-ethereum library.
-//
-// The go-ethereum library is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// The go-ethereum library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public License
-// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
-
-package keystore
+package main
 
 import (
-	"bytes"
-	"crypto/ecdsa"
-	"encoding/hex"
-	"encoding/json"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
-	"strings"
-	"time"
+	"io/ioutil"
+	"log"
 
-	"github.com/ethereum/go-ethereum/accounts"
-	"github.com/ethereum/go-ethereum/common"
+	"golang.org/x/crypto/scrypt"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/google/uuid"
 )
 
 const (
-	version = 3
+	keyFile      = "encrypted_keys.txt"
+	scryptN      = 16384
+	scryptR      = 8
+	scryptP      = 1
+	scryptKeyLen = 32
+	hmacKeyLen   = 32
 )
 
-type Key struct {
-	Id uuid.UUID // Version 4 "random" for unique id not derived from key data
-	// to simplify lookups we also store the address
-	Address common.Address
-	// we only store privkey as pubkey/address can be derived from it
-	// privkey in this struct is always in plaintext
-	PrivateKey *ecdsa.PrivateKey
-}
-
-type keyStore interface {
-	// Loads and decrypts the key from disk.
-	GetKey(addr common.Address, filename string, auth string) (*Key, error)
-	// Writes and encrypts the key.
-	StoreKey(filename string, k *Key, auth string) error
-	// Joins filename with the key directory unless it is already absolute.
-	JoinPath(filename string) string
-}
-
-type plainKeyJSON struct {
-	Address    string `json:"address"`
-	PrivateKey string `json:"privatekey"`
-	Id         string `json:"id"`
-	Version    int    `json:"version"`
-}
-
-type encryptedKeyJSONV3 struct {
-	Address string     `json:"address"`
-	Crypto  CryptoJSON `json:"crypto"`
-	Id      string     `json:"id"`
-	Version int        `json:"version"`
-}
-
-type encryptedKeyJSONV1 struct {
-	Address string     `json:"address"`
-	Crypto  CryptoJSON `json:"crypto"`
-	Id      string     `json:"id"`
-	Version string     `json:"version"`
-}
-
-type CryptoJSON struct {
-	Cipher       string                 `json:"cipher"`
-	CipherText   string                 `json:"ciphertext"`
-	CipherParams cipherparamsJSON       `json:"cipherparams"`
-	KDF          string                 `json:"kdf"`
-	KDFParams    map[string]interface{} `json:"kdfparams"`
-	MAC          string                 `json:"mac"`
-}
-
-type cipherparamsJSON struct {
-	IV string `json:"iv"`
-}
-
-func (k *Key) MarshalJSON() (j []byte, err error) {
-	jStruct := plainKeyJSON{
-		hex.EncodeToString(k.Address[:]),
-		hex.EncodeToString(crypto.FromECDSA(k.PrivateKey)),
-		k.Id.String(),
-		version,
-	}
-	j, err = json.Marshal(jStruct)
-	return j, err
-}
-
-func (k *Key) UnmarshalJSON(j []byte) (err error) {
-	keyJSON := new(plainKeyJSON)
-	err = json.Unmarshal(j, &keyJSON)
-	if err != nil {
-		return err
-	}
-
-	u := new(uuid.UUID)
-	*u, err = uuid.Parse(keyJSON.Id)
-	if err != nil {
-		return err
-	}
-	k.Id = *u
-	addr, err := hex.DecodeString(keyJSON.Address)
-	if err != nil {
-		return err
-	}
-	privkey, err := crypto.HexToECDSA(keyJSON.PrivateKey)
-	if err != nil {
-		return err
-	}
-
-	k.Address = common.BytesToAddress(addr)
-	k.PrivateKey = privkey
-
-	return nil
-}
-
-func newKeyFromECDSA(privateKeyECDSA *ecdsa.PrivateKey) *Key {
-	id, err := uuid.NewRandom()
-	if err != nil {
-		panic(fmt.Sprintf("Could not create random uuid: %v", err))
-	}
-	key := &Key{
-		Id:         id,
-		Address:    crypto.PubkeyToAddress(privateKeyECDSA.PublicKey),
-		PrivateKey: privateKeyECDSA,
-	}
-	return key
-}
-
-// NewKeyForDirectICAP generates a key whose address fits into < 155 bits so it can fit
-// into the Direct ICAP spec. for simplicity and easier compatibility with other libs, we
-// retry until the first byte is 0.
-func NewKeyForDirectICAP(rand io.Reader) *Key {
-	randBytes := make([]byte, 64)
-	_, err := rand.Read(randBytes)
-	if err != nil {
-		panic("key generation: could not read from random source: " + err.Error())
-	}
-	reader := bytes.NewReader(randBytes)
-	privateKeyECDSA, err := ecdsa.GenerateKey(crypto.S256(), reader)
-	if err != nil {
-		panic("key generation: ecdsa.GenerateKey failed: " + err.Error())
-	}
-	key := newKeyFromECDSA(privateKeyECDSA)
-	if !strings.HasPrefix(key.Address.Hex(), "0x00") {
-		return NewKeyForDirectICAP(rand)
-	}
-	return key
-}
-
-func newKey(rand io.Reader) (*Key, error) {
-	privateKeyECDSA, err := ecdsa.GenerateKey(crypto.S256(), rand)
+func generateAnonymousPrivateKey() (*ecdsa.PrivateKey, error) {
+	// Genera una chiave privata in modo anonimo utilizzando crypto/rand
+	privateKey, err := crypto.GenerateKey()
 	if err != nil {
 		return nil, err
 	}
-	return newKeyFromECDSA(privateKeyECDSA), nil
+
+	return privateKey, nil
 }
 
-func storeNewKey(ks keyStore, rand io.Reader, auth string) (*Key, accounts.Account, error) {
-	key, err := newKey(rand)
+func deriveAnonymousKey() ([]byte, error) {
+	// Genera una chiave di firma anonima
+	signatureKey, err := generateAnonymousSignatureKey()
 	if err != nil {
-		return nil, accounts.Account{}, err
+		return nil, err
 	}
-	a := accounts.Account{
-		Address: key.Address,
-		URL:     accounts.URL{Scheme: KeyStoreScheme, Path: ks.JoinPath(keyFileName(key.Address))},
-	}
-	if err := ks.StoreKey(a.URL.Path, key, auth); err != nil {
-		zeroKey(key.PrivateKey)
-		return nil, a, err
-	}
-	return key, a, err
-}
 
-func writeTemporaryKeyFile(file string, content []byte) (string, error) {
-	// Create the keystore directory with appropriate permissions
-	// in case it is not present yet.
-	const dirPerm = 0700
-	if err := os.MkdirAll(filepath.Dir(file), dirPerm); err != nil {
-		return "", err
+	// Genera un sale casuale per la derivazione
+	salt := make([]byte, 16)
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return nil, err
 	}
-	// Atomic write: create a temporary hidden file first
-	// then move it into place. TempFile assigns mode 0600.
-	f, err := os.CreateTemp(filepath.Dir(file), "."+filepath.Base(file)+".tmp")
+
+	// Utilizza scrypt per derivare una chiave dalla passphrase anonima
+	derivedKey, err := scrypt.Key([]byte("passphrase"), salt, scryptN, scryptR, scryptP, scryptKeyLen)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	if _, err := f.Write(content); err != nil {
-		f.Close()
-		os.Remove(f.Name())
-		return "", err
-	}
-	f.Close()
-	return f.Name(), nil
+
+	// Autentica la chiave derivata utilizzando una firma HMAC
+	mac := hmac.New(sha256.New, signatureKey)
+	mac.Write(derivedKey)
+	authenticatedDerivedKey := mac.Sum(nil)
+
+	return authenticatedDerivedKey, nil
 }
 
-func writeKeyFile(file string, content []byte) error {
-	name, err := writeTemporaryKeyFile(file, content)
+func generateAnonymousSignatureKey() ([]byte, error) {
+	// Genera una chiave di firma in modo anonimo utilizzando crypto/rand
+	signatureKey := make([]byte, hmacKeyLen)
+	if _, err := io.ReadFull(rand.Reader, signatureKey); err != nil {
+		return nil, err
+	}
+
+	return signatureKey, nil
+}
+
+func encryptPrivateKey(privateKey, key []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	ciphertext := make([]byte, aes.BlockSize+len(privateKey))
+	iv := ciphertext[:aes.BlockSize]
+	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+		return nil, err
+	}
+
+	stream := cipher.NewCFBEncrypter(block, iv)
+	stream.XORKeyStream(ciphertext[aes.BlockSize:], privateKey)
+
+	return ciphertext, nil
+}
+
+func saveKeysToFile(filename string, ciphertext, key []byte) error {
+	// Concatena la chiave privata cifrata e la chiave derivata
+	data := append(ciphertext, key...)
+
+	// Scrive i dati su file
+	err := ioutil.WriteFile(filename, data, 0600)
 	if err != nil {
 		return err
 	}
-	return os.Rename(name, file)
+
+	fmt.Printf("Chiavi salvate con successo nel file: %s\n", filename)
+	return nil
 }
 
-// keyFileName implements the naming convention for keyfiles:
-// UTC--<created_at UTC ISO8601>-<address hex>
-func keyFileName(keyAddr common.Address) string {
-	ts := time.Now().UTC()
-	return fmt.Sprintf("UTC--%s--%s", toISO8601(ts), hex.EncodeToString(keyAddr[:]))
-}
-
-func toISO8601(t time.Time) string {
-	var tz string
-	name, offset := t.Zone()
-	if name == "UTC" {
-		tz = "Z"
-	} else {
-		tz = fmt.Sprintf("%03d00", offset/3600)
+func main() {
+	// Genera una nuova chiave privata Ethereum in modo anonimo
+	privateKey, err := generateAnonymousPrivateKey()
+	if err != nil {
+		log.Fatal(err)
 	}
-	return fmt.Sprintf("%04d-%02d-%02dT%02d-%02d-%02d.%09d%s",
-		t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), tz)
+
+	// Deriva una chiave segreta in modo anonimo
+	derivedKey, err := deriveAnonymousKey()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Cifra la chiave privata utilizzando la chiave segreta anonima
+	ciphertext, err := encryptPrivateKey(privateKey.D.Bytes(), derivedKey)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Salva la chiave privata cifrata e la chiave segreta anonima su file in modo anonimo
+	err = saveKeysToFile(keyFile, ciphertext, derivedKey)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("La chiave privata è stata generata, cifrata e salvata in modo anonimo.")
 }
